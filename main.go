@@ -56,7 +56,6 @@ func main() {
 		for conn := range in {
 			conn := conn
 			metadata := conn.Metadata()
-			fmt.Printf("[%s] %s => %s\n", strings.ToUpper(metadata.NetWork.String()), metadata.SourceAddress(), metadata.RemoteAddress())
 			go func() {
 				ctx := context.Background()
 				rc, err := tnet.DialContext(ctx, metadata.NetWork.String(), metadata.RemoteAddress())
@@ -65,19 +64,18 @@ func main() {
 					return
 				}
 				_ = task.Run(ctx, func() error {
+					fmt.Printf("[%s] %s => %s\n", strings.ToUpper(metadata.NetWork.String()), metadata.SourceAddress(), metadata.RemoteAddress())
+					return nil
+				}, func() error {
 					_, err := io.Copy(rc, conn.Conn())
 					if err == nil {
 						err = io.EOF
-					} else {
-						log.Printf(errors.WithMessage(err, "server closed conn").Error())
 					}
 					return err
 				}, func() error {
 					_, err := io.Copy(conn.Conn(), rc)
 					if err == nil {
 						err = io.EOF
-					} else {
-						log.Printf(errors.WithMessage(err, "client closed conn").Error())
 					}
 					return err
 				})

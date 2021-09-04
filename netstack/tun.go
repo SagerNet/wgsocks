@@ -9,7 +9,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"gvisor.dev/gvisor/pkg/log"
 	"net"
 	"os"
 	"strconv"
@@ -357,8 +356,6 @@ func (tnet *Net) DialContext(ctx context.Context, network, address string) (net.
 				defer cancel()
 			}
 		}
-
-		log.Debugf("open connection to %s:%d", addr.String(), port)
 
 		var c net.Conn
 		if useUDP {
