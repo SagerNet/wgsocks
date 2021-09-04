@@ -7,11 +7,9 @@ package netstack
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
+	"gvisor.dev/gvisor/pkg/log"
 	"net"
 	"os"
 	"strconv"
@@ -20,7 +18,6 @@ import (
 
 	"golang.zx2c4.com/wireguard/tun"
 
-	"golang.org/x/net/dns/dnsmessage"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
@@ -37,6 +34,7 @@ type netTun struct {
 	dispatcher     stack.NetworkDispatcher
 	events         chan tun.Event
 	incomingPacket chan buffer.VectorisedView
+	resolver       *net.Resolver
 	mtu            int
 	hasV4, hasV6   bool
 }
@@ -89,7 +87,7 @@ func (*endpoint) ARPHardwareType() header.ARPHardwareType {
 func (e *endpoint) AddHeader(tcpip.LinkAddress, tcpip.LinkAddress, tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {
 }
 
-func CreateNetTUN(localAddresses []net.IP, mtu int) (tun.Device, *Net, error) {
+func CreateNetTUN(localAddresses []net.IP, dns string, mtu int) (tun.Device, *Net, error) {
 	opts := stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
@@ -99,7 +97,13 @@ func CreateNetTUN(localAddresses []net.IP, mtu int) (tun.Device, *Net, error) {
 		stack:          stack.New(opts),
 		events:         make(chan tun.Event, 10),
 		incomingPacket: make(chan buffer.VectorisedView),
-		mtu:            mtu,
+		resolver: &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				return net.Dial("tcp", dns)
+			},
+		},
+		mtu: mtu,
 	}
 	tcpipErr := dev.stack.CreateNIC(1, (*endpoint)(dev))
 	if tcpipErr != nil {
@@ -260,172 +264,6 @@ var (
 	errMissingAddress               = errors.New("missing address")
 )
 
-func randU16() uint16 {
-	var b [2]byte
-	_, err := rand.Read(b[:])
-	if err != nil {
-		panic(err)
-	}
-	return binary.LittleEndian.Uint16(b[:])
-}
-
-func newRequest(q dnsmessage.Question) (id uint16, udpReq, tcpReq []byte, err error) {
-	id = randU16()
-	b := dnsmessage.NewBuilder(make([]byte, 2, 514), dnsmessage.Header{ID: id, RecursionDesired: true})
-	b.EnableCompression()
-	if err := b.StartQuestions(); err != nil {
-		return 0, nil, nil, err
-	}
-	if err := b.Question(q); err != nil {
-		return 0, nil, nil, err
-	}
-	tcpReq, err = b.Finish()
-	udpReq = tcpReq[2:]
-	l := len(tcpReq) - 2
-	tcpReq[0] = byte(l >> 8)
-	tcpReq[1] = byte(l)
-	return id, udpReq, tcpReq, err
-}
-
-func equalASCIIName(x, y dnsmessage.Name) bool {
-	if x.Length != y.Length {
-		return false
-	}
-	for i := 0; i < int(x.Length); i++ {
-		a := x.Data[i]
-		b := y.Data[i]
-		if 'A' <= a && a <= 'Z' {
-			a += 0x20
-		}
-		if 'A' <= b && b <= 'Z' {
-			b += 0x20
-		}
-		if a != b {
-			return false
-		}
-	}
-	return true
-}
-
-func checkResponse(reqID uint16, reqQues dnsmessage.Question, respHdr dnsmessage.Header, respQues dnsmessage.Question) bool {
-	if !respHdr.Response {
-		return false
-	}
-	if reqID != respHdr.ID {
-		return false
-	}
-	if reqQues.Type != respQues.Type || reqQues.Class != respQues.Class || !equalASCIIName(reqQues.Name, respQues.Name) {
-		return false
-	}
-	return true
-}
-
-func dnsPacketRoundTrip(c net.Conn, id uint16, query dnsmessage.Question, b []byte) (dnsmessage.Parser, dnsmessage.Header, error) {
-	if _, err := c.Write(b); err != nil {
-		return dnsmessage.Parser{}, dnsmessage.Header{}, err
-	}
-	b = make([]byte, 512)
-	for {
-		n, err := c.Read(b)
-		if err != nil {
-			return dnsmessage.Parser{}, dnsmessage.Header{}, err
-		}
-		var p dnsmessage.Parser
-		h, err := p.Start(b[:n])
-		if err != nil {
-			continue
-		}
-		q, err := p.Question()
-		if err != nil || !checkResponse(id, query, h, q) {
-			continue
-		}
-		return p, h, nil
-	}
-}
-
-func dnsStreamRoundTrip(c net.Conn, id uint16, query dnsmessage.Question, b []byte) (dnsmessage.Parser, dnsmessage.Header, error) {
-	if _, err := c.Write(b); err != nil {
-		return dnsmessage.Parser{}, dnsmessage.Header{}, err
-	}
-	b = make([]byte, 1280)
-	if _, err := io.ReadFull(c, b[:2]); err != nil {
-		return dnsmessage.Parser{}, dnsmessage.Header{}, err
-	}
-	l := int(b[0])<<8 | int(b[1])
-	if l > len(b) {
-		b = make([]byte, l)
-	}
-	n, err := io.ReadFull(c, b[:l])
-	if err != nil {
-		return dnsmessage.Parser{}, dnsmessage.Header{}, err
-	}
-	var p dnsmessage.Parser
-	h, err := p.Start(b[:n])
-	if err != nil {
-		return dnsmessage.Parser{}, dnsmessage.Header{}, errCannotUnmarshalDNSMessage
-	}
-	q, err := p.Question()
-	if err != nil {
-		return dnsmessage.Parser{}, dnsmessage.Header{}, errCannotUnmarshalDNSMessage
-	}
-	if !checkResponse(id, query, h, q) {
-		return dnsmessage.Parser{}, dnsmessage.Header{}, errInvalidDNSResponse
-	}
-	return p, h, nil
-}
-
-func (tnet *Net) exchange(ctx context.Context, server string, q dnsmessage.Question, timeout time.Duration) (dnsmessage.Parser, dnsmessage.Header, error) {
-	q.Class = dnsmessage.ClassINET
-	id, udpReq, tcpReq, err := newRequest(q)
-	if err != nil {
-		return dnsmessage.Parser{}, dnsmessage.Header{}, errCannotMarshalDNSMessage
-	}
-
-	for _, useUDP := range []bool{true, false} {
-		ctx, cancel := context.WithDeadline(ctx, time.Now().Add(timeout))
-		defer cancel()
-
-		var c net.Conn
-		var err error
-		if useUDP {
-			c, err = tnet.Dial("udp", server)
-		} else {
-			c, err = tnet.DialContext(ctx, "tcp", server)
-		}
-
-		if err != nil {
-			return dnsmessage.Parser{}, dnsmessage.Header{}, err
-		}
-		if d, ok := ctx.Deadline(); ok && !d.IsZero() {
-			c.SetDeadline(d)
-		}
-		var p dnsmessage.Parser
-		var h dnsmessage.Header
-		if useUDP {
-			p, h, err = dnsPacketRoundTrip(c, id, q, udpReq)
-		} else {
-			p, h, err = dnsStreamRoundTrip(c, id, q, tcpReq)
-		}
-		c.Close()
-		if err != nil {
-			if err == context.Canceled {
-				err = errCanceled
-			} else if err == context.DeadlineExceeded {
-				err = errTimeout
-			}
-			return dnsmessage.Parser{}, dnsmessage.Header{}, err
-		}
-		if err := p.SkipQuestion(); err != dnsmessage.ErrSectionDone {
-			return dnsmessage.Parser{}, dnsmessage.Header{}, errInvalidDNSResponse
-		}
-		if h.Truncated {
-			continue
-		}
-		return p, h, nil
-	}
-	return dnsmessage.Parser{}, dnsmessage.Header{}, errNoAnswerFromDNSServer
-}
-
 func partialDeadline(now, deadline time.Time, addrsRemaining int) (time.Time, error) {
 	if deadline.IsZero() {
 		return deadline, nil
@@ -474,7 +312,7 @@ func (tnet *Net) DialContext(ctx context.Context, network, address string) (net.
 	if err != nil || port < 0 || port > 65535 {
 		return nil, &net.OpError{Op: "dial", Err: errNumericPort}
 	}
-	allAddr, err := net.DefaultResolver.LookupHost(ctx, host)
+	allAddr, err := tnet.resolver.LookupHost(ctx, host)
 	if err != nil {
 		return nil, &net.OpError{Op: "dial", Err: err}
 	}
@@ -487,7 +325,7 @@ func (tnet *Net) DialContext(ctx context.Context, network, address string) (net.
 		}
 	}
 	if len(addrs) == 0 && len(allAddr) != 0 {
-		return nil, &net.OpError{Op: "dial", Err: errNoSuitableAddress}
+		return nil, &net.OpError{Op: "dial", Err: errors.New("empty response")}
 	}
 
 	var firstErr error
@@ -519,6 +357,8 @@ func (tnet *Net) DialContext(ctx context.Context, network, address string) (net.
 				defer cancel()
 			}
 		}
+
+		log.Debugf("open connection to %s:%d", addr.String(), port)
 
 		var c net.Conn
 		if useUDP {
