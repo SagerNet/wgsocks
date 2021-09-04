@@ -42,7 +42,7 @@ func main() {
 	if err != nil {
 		log.Fatalln(errors.WithMessage(err, "create net tun").Error())
 	}
-	dev := device.NewDevice(tun, wgConn.NewDefaultBind(), device.NewLogger(device.LogLevelVerbose, ""))
+	dev := device.NewDevice(tun, wgConn.NewStdNetBind(), device.NewLogger(device.LogLevelVerbose, ""))
 	err = dev.IpcSet(cc)
 	if err != nil {
 		log.Fatalln(errors.WithMessage(err, "load conf").Error())
