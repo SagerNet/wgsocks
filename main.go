@@ -36,9 +36,12 @@ func main() {
 	}
 	cc := string(b)
 
+	net.DefaultResolver.Dial = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return net.Dial("tcp", *dns)
+	}
+
 	tun, tnet, err := netstack.CreateNetTUN(
 		[]net.IP{net.ParseIP(*addr)},
-		[]string{*dns},
 		*mtu)
 	if err != nil {
 		log.Fatalln(errors.WithMessage(err, "create net tun").Error())

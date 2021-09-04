@@ -38,7 +38,6 @@ type netTun struct {
 	events         chan tun.Event
 	incomingPacket chan buffer.VectorisedView
 	mtu            int
-	dnsServers     []string
 	hasV4, hasV6   bool
 }
 type endpoint netTun
@@ -90,7 +89,7 @@ func (*endpoint) ARPHardwareType() header.ARPHardwareType {
 func (e *endpoint) AddHeader(tcpip.LinkAddress, tcpip.LinkAddress, tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {
 }
 
-func CreateNetTUN(localAddresses []net.IP, dnsServers []string, mtu int) (tun.Device, *Net, error) {
+func CreateNetTUN(localAddresses []net.IP, mtu int) (tun.Device, *Net, error) {
 	opts := stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
@@ -100,7 +99,6 @@ func CreateNetTUN(localAddresses []net.IP, dnsServers []string, mtu int) (tun.De
 		stack:          stack.New(opts),
 		events:         make(chan tun.Event, 10),
 		incomingPacket: make(chan buffer.VectorisedView),
-		dnsServers:     dnsServers,
 		mtu:            mtu,
 	}
 	tcpipErr := dev.stack.CreateNIC(1, (*endpoint)(dev))
@@ -261,51 +259,6 @@ var (
 	errNoSuitableAddress            = errors.New("no suitable address found")
 	errMissingAddress               = errors.New("missing address")
 )
-
-func (net *Net) LookupHost(host string) (addrs []string, err error) {
-	return net.LookupContextHost(context.Background(), host)
-}
-
-func isDomainName(s string) bool {
-	l := len(s)
-	if l == 0 || l > 254 || l == 254 && s[l-1] != '.' {
-		return false
-	}
-	last := byte('.')
-	nonNumeric := false
-	partlen := 0
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		default:
-			return false
-		case 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || c == '_':
-			nonNumeric = true
-			partlen++
-		case '0' <= c && c <= '9':
-			partlen++
-		case c == '-':
-			if last == '.' {
-				return false
-			}
-			partlen++
-			nonNumeric = true
-		case c == '.':
-			if last == '.' || last == '-' {
-				return false
-			}
-			if partlen > 63 || partlen == 0 {
-				return false
-			}
-			partlen = 0
-		}
-		last = c
-	}
-	if last == '-' || partlen > 63 {
-		return false
-	}
-	return nonNumeric
-}
 
 func randU16() uint16 {
 	var b [2]byte
@@ -473,233 +426,6 @@ func (tnet *Net) exchange(ctx context.Context, server string, q dnsmessage.Quest
 	return dnsmessage.Parser{}, dnsmessage.Header{}, errNoAnswerFromDNSServer
 }
 
-func checkHeader(p *dnsmessage.Parser, h dnsmessage.Header) error {
-	if h.RCode == dnsmessage.RCodeNameError {
-		return errNoSuchHost
-	}
-	_, err := p.AnswerHeader()
-	if err != nil && err != dnsmessage.ErrSectionDone {
-		return errCannotUnmarshalDNSMessage
-	}
-	if h.RCode == dnsmessage.RCodeSuccess && !h.Authoritative && !h.RecursionAvailable && err == dnsmessage.ErrSectionDone {
-		return errLameReferral
-	}
-	if h.RCode != dnsmessage.RCodeSuccess && h.RCode != dnsmessage.RCodeNameError {
-		if h.RCode == dnsmessage.RCodeServerFailure {
-			return errServerTemporarilyMisbehaving
-		}
-		return errServerMisbehaving
-	}
-	return nil
-}
-
-func skipToAnswer(p *dnsmessage.Parser, qtype dnsmessage.Type) error {
-	for {
-		h, err := p.AnswerHeader()
-		if err == dnsmessage.ErrSectionDone {
-			return errNoSuchHost
-		}
-		if err != nil {
-			return errCannotUnmarshalDNSMessage
-		}
-		if h.Type == qtype {
-			return nil
-		}
-		if err := p.SkipAnswer(); err != nil {
-			return errCannotUnmarshalDNSMessage
-		}
-	}
-}
-
-func (tnet *Net) tryOneName(ctx context.Context, name string, qtype dnsmessage.Type) (dnsmessage.Parser, string, error) {
-	var lastErr error
-
-	n, err := dnsmessage.NewName(name)
-	if err != nil {
-		return dnsmessage.Parser{}, "", errCannotMarshalDNSMessage
-	}
-	q := dnsmessage.Question{
-		Name:  n,
-		Type:  qtype,
-		Class: dnsmessage.ClassINET,
-	}
-
-	for i := 0; i < 2; i++ {
-		for _, server := range tnet.dnsServers {
-			p, h, err := tnet.exchange(ctx, server, q, time.Second*5)
-			if err != nil {
-				dnsErr := &net.DNSError{
-					Err:    err.Error(),
-					Name:   name,
-					Server: server,
-				}
-				if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
-					dnsErr.IsTimeout = true
-				}
-				if _, ok := err.(*net.OpError); ok {
-					dnsErr.IsTemporary = true
-				}
-				lastErr = dnsErr
-				continue
-			}
-
-			if err := checkHeader(&p, h); err != nil {
-				dnsErr := &net.DNSError{
-					Err:    err.Error(),
-					Name:   name,
-					Server: server,
-				}
-				if err == errServerTemporarilyMisbehaving {
-					dnsErr.IsTemporary = true
-				}
-				if err == errNoSuchHost {
-					dnsErr.IsNotFound = true
-					return p, server, dnsErr
-				}
-				lastErr = dnsErr
-				continue
-			}
-
-			err = skipToAnswer(&p, qtype)
-			if err == nil {
-				return p, server, nil
-			}
-			lastErr = &net.DNSError{
-				Err:    err.Error(),
-				Name:   name,
-				Server: server,
-			}
-			if err == errNoSuchHost {
-				lastErr.(*net.DNSError).IsNotFound = true
-				return p, server, lastErr
-			}
-		}
-	}
-	return dnsmessage.Parser{}, "", lastErr
-}
-
-func (tnet *Net) LookupContextHost(ctx context.Context, host string) ([]string, error) {
-	if host == "" || (!tnet.hasV6 && !tnet.hasV4) {
-		return nil, &net.DNSError{Err: errNoSuchHost.Error(), Name: host, IsNotFound: true}
-	}
-	zlen := len(host)
-	if strings.IndexByte(host, ':') != -1 {
-		if zidx := strings.LastIndexByte(host, '%'); zidx != -1 {
-			zlen = zidx
-		}
-	}
-	if ip := net.ParseIP(host[:zlen]); ip != nil {
-		return []string{host[:zlen]}, nil
-	}
-
-	if !isDomainName(host) {
-		return nil, &net.DNSError{Err: errNoSuchHost.Error(), Name: host, IsNotFound: true}
-	}
-	type result struct {
-		p      dnsmessage.Parser
-		server string
-		error
-	}
-	var addrsV4, addrsV6 []net.IP
-	lanes := 0
-	if tnet.hasV4 {
-		lanes++
-	}
-	if tnet.hasV6 {
-		lanes++
-	}
-	lane := make(chan result, lanes)
-	var lastErr error
-	if tnet.hasV4 {
-		go func() {
-			p, server, err := tnet.tryOneName(ctx, host+".", dnsmessage.TypeA)
-			lane <- result{p, server, err}
-		}()
-	}
-	if tnet.hasV6 {
-		go func() {
-			p, server, err := tnet.tryOneName(ctx, host+".", dnsmessage.TypeAAAA)
-			lane <- result{p, server, err}
-		}()
-	}
-	for l := 0; l < lanes; l++ {
-		result := <-lane
-		if result.error != nil {
-			if lastErr == nil {
-				lastErr = result.error
-			}
-			continue
-		}
-
-	loop:
-		for {
-			h, err := result.p.AnswerHeader()
-			if err != nil && err != dnsmessage.ErrSectionDone {
-				lastErr = &net.DNSError{
-					Err:    errCannotMarshalDNSMessage.Error(),
-					Name:   host,
-					Server: result.server,
-				}
-			}
-			if err != nil {
-				break
-			}
-			switch h.Type {
-			case dnsmessage.TypeA:
-				a, err := result.p.AResource()
-				if err != nil {
-					lastErr = &net.DNSError{
-						Err:    errCannotMarshalDNSMessage.Error(),
-						Name:   host,
-						Server: result.server,
-					}
-					break loop
-				}
-				addrsV4 = append(addrsV4, net.IP(a.A[:]))
-
-			case dnsmessage.TypeAAAA:
-				aaaa, err := result.p.AAAAResource()
-				if err != nil {
-					lastErr = &net.DNSError{
-						Err:    errCannotMarshalDNSMessage.Error(),
-						Name:   host,
-						Server: result.server,
-					}
-					break loop
-				}
-				addrsV6 = append(addrsV6, net.IP(aaaa.AAAA[:]))
-
-			default:
-				if err := result.p.SkipAnswer(); err != nil {
-					lastErr = &net.DNSError{
-						Err:    errCannotMarshalDNSMessage.Error(),
-						Name:   host,
-						Server: result.server,
-					}
-					break loop
-				}
-				continue
-			}
-		}
-	}
-	// We don't do RFC6724. Instead just put V6 addresess first if an IPv6 address is enabled
-	var addrs []net.IP
-	if tnet.hasV6 {
-		addrs = append(addrsV6, addrsV4...)
-	} else {
-		addrs = append(addrsV4, addrsV6...)
-	}
-
-	if len(addrs) == 0 && lastErr != nil {
-		return nil, lastErr
-	}
-	saddrs := make([]string, 0, len(addrs))
-	for _, ip := range addrs {
-		saddrs = append(saddrs, ip.String())
-	}
-	return saddrs, nil
-}
-
 func partialDeadline(now, deadline time.Time, addrsRemaining int) (time.Time, error) {
 	if deadline.IsZero() {
 		return deadline, nil
@@ -748,7 +474,7 @@ func (tnet *Net) DialContext(ctx context.Context, network, address string) (net.
 	if err != nil || port < 0 || port > 65535 {
 		return nil, &net.OpError{Op: "dial", Err: errNumericPort}
 	}
-	allAddr, err := tnet.LookupContextHost(ctx, host)
+	allAddr, err := net.DefaultResolver.LookupHost(ctx, host)
 	if err != nil {
 		return nil, &net.OpError{Op: "dial", Err: err}
 	}
