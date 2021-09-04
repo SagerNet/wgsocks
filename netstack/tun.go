@@ -38,7 +38,7 @@ type netTun struct {
 	events         chan tun.Event
 	incomingPacket chan buffer.VectorisedView
 	mtu            int
-	dnsServers     []net.IP
+	dnsServers     []string
 	hasV4, hasV6   bool
 }
 type endpoint netTun
@@ -90,7 +90,7 @@ func (*endpoint) ARPHardwareType() header.ARPHardwareType {
 func (e *endpoint) AddHeader(tcpip.LinkAddress, tcpip.LinkAddress, tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {
 }
 
-func CreateNetTUN(localAddresses, dnsServers []net.IP, mtu int) (tun.Device, *Net, error) {
+func CreateNetTUN(localAddresses []net.IP, dnsServers []string, mtu int) (tun.Device, *Net, error) {
 	opts := stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
@@ -421,7 +421,7 @@ func dnsStreamRoundTrip(c net.Conn, id uint16, query dnsmessage.Question, b []by
 	return p, h, nil
 }
 
-func (tnet *Net) exchange(ctx context.Context, server net.IP, q dnsmessage.Question, timeout time.Duration) (dnsmessage.Parser, dnsmessage.Header, error) {
+func (tnet *Net) exchange(ctx context.Context, server string, q dnsmessage.Question, timeout time.Duration) (dnsmessage.Parser, dnsmessage.Header, error) {
 	q.Class = dnsmessage.ClassINET
 	id, udpReq, tcpReq, err := newRequest(q)
 	if err != nil {
@@ -435,9 +435,9 @@ func (tnet *Net) exchange(ctx context.Context, server net.IP, q dnsmessage.Quest
 		var c net.Conn
 		var err error
 		if useUDP {
-			c, err = tnet.DialUDP(nil, &net.UDPAddr{IP: server, Port: 53})
+			c, err = tnet.Dial("udp", server)
 		} else {
-			c, err = tnet.DialContextTCP(ctx, &net.TCPAddr{IP: server, Port: 53})
+			c, err = tnet.DialContext(ctx, "tcp", server)
 		}
 
 		if err != nil {
@@ -531,7 +531,7 @@ func (tnet *Net) tryOneName(ctx context.Context, name string, qtype dnsmessage.T
 				dnsErr := &net.DNSError{
 					Err:    err.Error(),
 					Name:   name,
-					Server: server.String(),
+					Server: server,
 				}
 				if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
 					dnsErr.IsTimeout = true
@@ -547,14 +547,14 @@ func (tnet *Net) tryOneName(ctx context.Context, name string, qtype dnsmessage.T
 				dnsErr := &net.DNSError{
 					Err:    err.Error(),
 					Name:   name,
-					Server: server.String(),
+					Server: server,
 				}
 				if err == errServerTemporarilyMisbehaving {
 					dnsErr.IsTemporary = true
 				}
 				if err == errNoSuchHost {
 					dnsErr.IsNotFound = true
-					return p, server.String(), dnsErr
+					return p, server, dnsErr
 				}
 				lastErr = dnsErr
 				continue
@@ -562,16 +562,16 @@ func (tnet *Net) tryOneName(ctx context.Context, name string, qtype dnsmessage.T
 
 			err = skipToAnswer(&p, qtype)
 			if err == nil {
-				return p, server.String(), nil
+				return p, server, nil
 			}
 			lastErr = &net.DNSError{
 				Err:    err.Error(),
 				Name:   name,
-				Server: server.String(),
+				Server: server,
 			}
 			if err == errNoSuchHost {
 				lastErr.(*net.DNSError).IsNotFound = true
-				return p, server.String(), lastErr
+				return p, server, lastErr
 			}
 		}
 	}

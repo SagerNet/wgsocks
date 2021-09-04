@@ -24,9 +24,10 @@ import (
 func main() {
 	fs := flag.NewFlagSet("wgsocks", flag.ExitOnError)
 	addr := fs.String("a", "10.0.0.2", "local address")
-	dns := fs.String("d", "1.0.0.1", "dns address")
+	dns := fs.String("d", "1.0.0.1:53", "dns server")
 	conf := fs.String("c", "wireguard.conf", "config file")
 	bind := fs.String("b", "127.0.0.1:1080", "socks5 bind address")
+	mtu := fs.Int("m", 1420, "mtu")
 	_ = fs.Parse(os.Args[1:])
 
 	b, err := ioutil.ReadFile(*conf)
@@ -37,8 +38,8 @@ func main() {
 
 	tun, tnet, err := netstack.CreateNetTUN(
 		[]net.IP{net.ParseIP(*addr)},
-		[]net.IP{net.ParseIP(*dns)},
-		1420)
+		[]string{*dns},
+		*mtu)
 	if err != nil {
 		log.Fatalln(errors.WithMessage(err, "create net tun").Error())
 	}
