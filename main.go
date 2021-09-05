@@ -36,7 +36,11 @@ func main() {
 	}
 	cc := string(b)
 
-	tun, tnet, err := netstack.CreateNetTUN([]net.IP{net.ParseIP(*addr)}, *dns, *mtu)
+	var addrs []net.IP
+	for _, ipAddr := range strings.Split(*addr, ",") {
+		addrs = append(addrs, net.ParseIP(ipAddr))
+	}
+	tun, tnet, err := netstack.CreateNetTUN(addrs, *dns, *mtu)
 	if err != nil {
 		log.Fatalln(errors.WithMessage(err, "create net tun").Error())
 	}
