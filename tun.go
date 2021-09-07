@@ -3,7 +3,7 @@
  * Copyright (C) 2019-2021 WireGuard LLC. All Rights Reserved.
  */
 
-package netstack
+package main
 
 import (
 	"context"
@@ -86,7 +86,7 @@ func (*endpoint) ARPHardwareType() header.ARPHardwareType {
 func (e *endpoint) AddHeader(tcpip.LinkAddress, tcpip.LinkAddress, tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {
 }
 
-func CreateNetTUN(localAddresses []net.IP, dns string, mtu int) (tun.Device, *Net, error) {
+func CreateNetTUN(localAddresses []net.IP, dns *net.Resolver, mtu int) (tun.Device, *Net, error) {
 	opts := stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
@@ -96,13 +96,8 @@ func CreateNetTUN(localAddresses []net.IP, dns string, mtu int) (tun.Device, *Ne
 		stack:          stack.New(opts),
 		events:         make(chan tun.Event, 10),
 		incomingPacket: make(chan buffer.VectorisedView),
-		resolver: &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				return net.Dial("tcp", dns)
-			},
-		},
-		mtu: mtu,
+		resolver:       dns,
+		mtu:            mtu,
 	}
 	tcpipErr := dev.stack.CreateNIC(1, (*endpoint)(dev))
 	if tcpipErr != nil {

@@ -18,7 +18,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"wssocks/netstack"
+	"time"
 )
 
 func main() {
@@ -34,13 +34,46 @@ func main() {
 	if err != nil {
 		log.Fatalln(errors.WithMessage(err, "read conf"))
 	}
+
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return net.Dial("tcp", *dns)
+		},
+	}
+
 	cc := string(b)
+	for _, line := range strings.Split(cc, "\n") {
+		parts := strings.Split(line, "=")
+		if len(parts) < 2 {
+			continue
+		}
+		if parts[0] == "endpoint" {
+			address := strings.Split(parts[1], ":")
+			if len(address) < 2 {
+				break
+			}
+
+			for i := 0; i < 5; i++ {
+				ip, err := resolver.LookupIP(context.Background(), "ip", address[0])
+				if err != nil || len(ip) == 0 {
+					if err != nil {
+						log.Println(err.Error())
+					}
+					log.Println("failed to resolve endpoint address")
+					time.Sleep(time.Second)
+					continue
+				}
+				cc = strings.ReplaceAll(cc, line, parts[0]+"="+ip[0].String()+":"+address[1])
+			}
+		}
+	}
 
 	var addrs []net.IP
 	for _, ipAddr := range strings.Split(*addr, ",") {
 		addrs = append(addrs, net.ParseIP(ipAddr))
 	}
-	tun, tnet, err := netstack.CreateNetTUN(addrs, *dns, *mtu)
+	tun, tnet, err := CreateNetTUN(addrs, resolver, *mtu)
 	if err != nil {
 		log.Fatalln(errors.WithMessage(err, "create net tun").Error())
 	}
