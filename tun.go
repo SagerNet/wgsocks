@@ -38,6 +38,15 @@ type netTun struct {
 	hasV4, hasV6   bool
 }
 type endpoint netTun
+
+func (e *endpoint) WritePackets(stack.RouteInfo, stack.PacketBufferList, tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
+	return 0, &tcpip.ErrNotSupported{}
+}
+
+func (e *endpoint) WriteRawPacket(*stack.PacketBuffer) tcpip.Error {
+	return &tcpip.ErrNotSupported{}
+}
+
 type Net netTun
 
 func (e *endpoint) Attach(dispatcher stack.NetworkDispatcher) {
@@ -73,10 +82,6 @@ func (*endpoint) Wait() {}
 func (e *endpoint) WritePacket(_ stack.RouteInfo, _ tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) tcpip.Error {
 	e.incomingPacket <- buffer.NewVectorisedView(pkt.Size(), pkt.Views())
 	return nil
-}
-
-func (e *endpoint) WritePackets(stack.RouteInfo, stack.PacketBufferList, tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
-	panic("not implemented")
 }
 
 func (*endpoint) ARPHardwareType() header.ARPHardwareType {
