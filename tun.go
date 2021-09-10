@@ -39,12 +39,25 @@ type netTun struct {
 }
 type endpoint netTun
 
-func (e *endpoint) WritePackets(stack.RouteInfo, stack.PacketBufferList, tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
-	return 0, &tcpip.ErrNotSupported{}
+// WritePackets writes packets back into io.ReadWriter.
+func (e *endpoint) WritePackets(_ stack.RouteInfo, pkts stack.PacketBufferList, _ tcpip.NetworkProtocolNumber) (int, tcpip.Error) {
+	n := 0
+	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
+		if err := e.WriteRawPacket(pkt); err != nil {
+			break
+		}
+		n++
+	}
+	return n, nil
 }
 
-func (e *endpoint) WriteRawPacket(*stack.PacketBuffer) tcpip.Error {
-	return &tcpip.ErrNotSupported{}
+func (e *endpoint) WriteRawPacket(buffer *stack.PacketBuffer) tcpip.Error {
+	data := buffer.Data().ExtractVV()
+	_, err := (*netTun)(e).Write(data.ToView(), 0)
+	if err != nil {
+		return &tcpip.ErrAborted{}
+	}
+	return nil
 }
 
 type Net netTun
