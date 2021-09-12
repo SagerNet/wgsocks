@@ -64,7 +64,7 @@ func main() {
 					time.Sleep(time.Second)
 					continue
 				}
-				cc = strings.ReplaceAll(cc, line, parts[0]+"="+ip[0].String()+":"+address[1])
+				cc = strings.ReplaceAll(cc, line, parts[0]+"="+net.JoinHostPort(ip[0].String(), address[1]))
 			}
 		}
 	}
