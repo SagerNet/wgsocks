@@ -4,12 +4,15 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/Dreamacro/clash/adapter/inbound"
+	"github.com/Dreamacro/clash/common/pool"
 	"github.com/Dreamacro/clash/constant"
 	"github.com/Dreamacro/clash/listener/socks"
 	"github.com/pkg/errors"
 	"github.com/v2fly/v2ray-core/v4/common/task"
 	wgConn "golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"io"
 	"io/ioutil"
 	"log"
@@ -122,11 +125,92 @@ func main() {
 		}
 	}()
 
+	udpIn := make(chan *inbound.PacketAdapter, 100)
+	lp, err := socks.NewUDP(*bind, udpIn)
+	if err != nil {
+		log.Fatalf(errors.WithMessage(err, "create socks5 udp server").Error())
+	}
+	nat := &natTable{}
+
+	go func() {
+		for pkt := range udpIn {
+			packet := pkt
+			metadata := pkt.Metadata()
+			go func() {
+				defer packet.Drop()
+				natKey := metadata.SourceAddress()
+				sendTo := func() bool {
+					conn := nat.Get(natKey)
+					if conn == nil {
+						return false
+					}
+					_, err := conn.WriteTo(packet.Data(), metadata.UDPAddr())
+					if err != nil {
+						_ = conn.Close()
+					}
+					return true
+				}
+
+				if sendTo() {
+					return
+				}
+
+				lockKey := natKey + "-lock"
+				cond, loaded := nat.GetOrCreateLock(lockKey)
+				if loaded {
+					cond.L.Lock()
+					cond.Wait()
+					sendTo()
+					cond.L.Unlock()
+					return
+				}
+
+				nat.Delete(lockKey)
+				cond.Broadcast()
+
+				conn, err := tnet.DialContext(context.Background(), "udp", metadata.RemoteAddress())
+				if err != nil {
+					log.Printf(errors.WithMessagef(err, "dial to %s failed", metadata.RemoteAddress()).Error())
+					return
+				}
+				udpConn := conn.(*gonet.UDPConn)
+				nat.Set(natKey, udpConn)
+				fmt.Printf("[%s] %s => %s\n", strings.ToUpper(metadata.NetWork.String()), metadata.SourceAddress(), metadata.RemoteAddress())
+
+				go sendTo()
+
+				buffer := pool.Get(pool.RelayBufferSize)
+				for {
+					n, addr, err := udpConn.ReadFrom(buffer)
+					if err != nil {
+						break
+					}
+					if addr, ok := addr.(*net.UDPAddr); ok {
+						_, err = packet.WriteBack(buffer[:n], addr)
+					} else {
+						_, err = packet.WriteBack(buffer[:n], nil)
+					}
+					if err != nil {
+						break
+					}
+				}
+
+				// close
+
+				_ = udpConn.Close()
+				_ = pool.Put(buffer)
+				nat.Delete(natKey)
+			}()
+		}
+	}()
+
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 
 	close(in)
+	close(udpIn)
 	ln.Close()
+	_ = lp.Close()
 
 }
